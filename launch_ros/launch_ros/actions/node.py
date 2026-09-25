@@ -42,6 +42,8 @@ from launch.utilities import ensure_argument_type
 from launch.utilities import normalize_to_list_of_substitutions
 from launch.utilities import perform_substitutions
 
+from launch_ros.distributed import get_local_machine_name
+from launch_ros.distributed import launch_node_remotely
 from launch_ros.parameters_type import SomeParameters
 from launch_ros.remap_rule_type import SomeRemapRules
 from launch_ros.substitutions import ExecutableInPackage
@@ -493,9 +495,16 @@ class Node(ExecuteProcess):
         """
         Execute the action.
 
-        Delegated to :meth:`launch.actions.ExecuteProcess.execute`.
+        Delegated to :meth:`launch.actions.ExecuteProcess.execute`, unless the Node is meant
+        for another machine, in which case that machine is asked to launch it.
         """
         self._perform_substitutions(context)
+        if self.__machine is not None:
+            machine = perform_substitutions(
+                context, normalize_to_list_of_substitutions(self.__machine))
+            if machine and machine != get_local_machine_name(context):
+                launch_node_remotely(context, machine, self._get_remote_spec(context))
+                return None
         # Prepare the ros_specific_arguments list and add it to the context so that the
         # LocalSubstitution placeholders added to the the cmd can be expanded using the contents.
         ros_specific_arguments: Dict[str, Union[str, List[str]]] = {}
@@ -527,6 +536,39 @@ class Node(ExecuteProcess):
                 )
 
         return ret
+
+    def _get_remote_spec(self, context: LaunchContext) -> Dict:
+        """
+        Describe this Node, after substitutions, for another machine to launch it.
+
+        See :func:`launch_ros.distributed.node_from_spec` for the other side.
+        """
+        def expand(value):
+            return perform_substitutions(context, normalize_to_list_of_substitutions(value))
+
+        parameters = []
+        # Same order as the command line built by _perform_substitutions: global params first.
+        for param in context.launch_configurations.get('global_params', None) or []:
+            if isinstance(param, tuple):
+                parameters.append({'rule': '{}:={}'.format(*param)})
+        for param_argument, is_file in self.__expanded_parameter_arguments or []:
+            if is_file:
+                with open(param_argument, 'r') as f:
+                    parameters.append({'file': f.read()})
+            else:
+                parameters.append({'rule': param_argument})
+        return {
+            'package': expand(self.__package) if self.__package is not None else None,
+            'executable': expand(self.__node_executable),
+            'name': self.__expanded_node_name if self.__node_name is not None else None,
+            'namespace': (
+                self.__expanded_node_namespace
+                if self.__expanded_node_namespace != self.UNSPECIFIED_NODE_NAMESPACE else None),
+            'parameters': parameters,
+            'remappings': [list(rule) for rule in self.__expanded_remappings or []],
+            'arguments': [expand(arg) for arg in self.__arguments or []],
+            'ros_arguments': [expand(arg) for arg in self.__ros_arguments or []],
+        }
 
     @property
     def expanded_node_namespace(self):

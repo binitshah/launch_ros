@@ -12,22 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-machine rclpy node that lives for as long as a LaunchService is running."""
+"""Per-machine rclpy node that launches Nodes on behalf of other machines' launch files."""
 
+import json
 import os
-import re
 import threading
 from typing import Optional
 from typing import Text
 
+from ament_index_python.packages import get_package_prefix
+from ament_index_python.packages import PackageNotFoundError
+from diagnostic_msgs.srv import AddDiagnostics
 import launch
+from launch.events import IncludeLaunchDescription
+from launch.events.process import ShutdownProcess
 import launch.logging
+from launch_ros.distributed import LAUNCH_NODE_SERVICE
+from launch_ros.distributed import machine_name_to_node_name
+from launch_ros.distributed import node_from_spec
+from launch_ros.distributed import set_local_machine_name
+from launch_ros.distributed import STOP_NODES_SERVICE
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
-from std_msgs.msg import String
 
 MACHINE_ENV_VAR = 'MACHINE'
-TEST_TOPIC = '~/test_string'
 
 
 def get_machine_name(override: Optional[Text] = None) -> Optional[Text]:
@@ -37,52 +45,126 @@ def get_machine_name(override: Optional[Text] = None) -> Optional[Text]:
     return os.environ.get(MACHINE_ENV_VAR) or None
 
 
-def machine_name_to_node_name(machine_name: Text) -> Text:
-    """Turn an arbitrary machine name (e.g. a hostname) into a valid ROS node name."""
-    node_name = re.sub(r'[^A-Za-z0-9_]', '_', machine_name)
-    if not node_name or node_name[0].isdigit():
-        node_name = 'machine_' + node_name
-    return node_name
+def check_executable(package: Optional[Text], executable: Text) -> Optional[Text]:
+    """Return why `executable` in `package` can't be run on this machine, or None if it can."""
+    if package is None:
+        return None
+    try:
+        prefix = get_package_prefix(package)
+    except PackageNotFoundError:
+        return "package '{}' not found".format(package)
+    if not os.path.isfile(os.path.join(prefix, 'lib', package, executable)):
+        return "executable '{}' not found in package '{}'".format(executable, package)
+    return None
 
 
 class MachineNode:
-    """An rclpy node named after the machine, spun in its own context and thread."""
+    """
+    An rclpy node named after the machine, spun in its own context and thread.
+
+    It serves `launch_ros.distributed`'s launch_node and stop_nodes services, launching Nodes
+    into the given launch context. Nodes launched for a requester are stopped when it asks, or
+    when it leaves the ROS graph (e.g. its launch was killed).
+    """
 
     def __init__(self, machine_name: Text):
         self.__machine_name = machine_name
         self.__logger = launch.logging.get_logger('machine.' + machine_name)
+        self.__launch_context = None
         self.__context = None
         self.__node = None
         self.__executor = None
         self.__thread = None
         self.__is_running = False
+        # Only touched from the executor thread.
+        self.__nodes_by_requester = {}
+        self.__requesters_seen_in_graph = set()
 
-    def start(self):
+    def start(self, launch_context: launch.LaunchContext):
         if self.__is_running:
             raise RuntimeError('Cannot start a MachineNode that is already running')
+        self.__launch_context = launch_context
         # A non-default context keeps rclpy from installing signal handlers that
         # would fight with the ones installed by the LaunchService.
         self.__context = rclpy.Context()
         rclpy.init(args=[], context=self.__context)
         self.__node = rclpy.create_node(
             machine_name_to_node_name(self.__machine_name), context=self.__context)
-        # TODO: replace this test subscription with one that receives the nodes to launch.
-        self.__node.create_subscription(String, TEST_TOPIC, self._on_test_string, 10)
+        self.__node.create_service(
+            AddDiagnostics, '~/' + LAUNCH_NODE_SERVICE, self._on_launch_node)
+        self.__node.create_service(
+            AddDiagnostics, '~/' + STOP_NODES_SERVICE, self._on_stop_nodes)
+        self.__node.create_timer(1.0, self._stop_nodes_of_departed_requesters)
         self.__executor = SingleThreadedExecutor(context=self.__context)
         self.__executor.add_node(self.__node)
         self.__is_running = True
         self.__thread = threading.Thread(target=self._spin, daemon=True)
         self.__thread.start()
-        self.__logger.info("machine node '{}' subscribed to '{}'".format(
+        self.__logger.info("machine node '{}' is serving '{}'".format(
             self.__node.get_fully_qualified_name(),
-            self.__node.resolve_topic_name(TEST_TOPIC)))
+            self.__node.resolve_service_name('~/' + LAUNCH_NODE_SERVICE)))
 
     def _spin(self):
         while self.__is_running:
             self.__executor.spin_once(timeout_sec=0.1)
 
-    def _on_test_string(self, msg: String):
-        self.__logger.info('received test string: {}'.format(msg.data))
+    def _emit_event(self, event):
+        # Queued from the launch loop's own thread, without waiting on it: the loop may be
+        # waiting on this thread in shutdown().
+        context = self.__launch_context
+        context.asyncio_loop.call_soon_threadsafe(context.emit_event_sync, event)
+
+    def _on_launch_node(self, request, response):
+        try:
+            data = json.loads(request.load_namespace)
+            requester = data['requester']
+            spec = data['node']
+            error = check_executable(spec['package'], spec['executable'])
+            node = None if error else node_from_spec(spec)
+        except Exception as e:
+            error = 'invalid request: {!r}'.format(e)
+        if error:
+            self.__logger.error('Refusing to launch a node: {}'.format(error))
+            response.success = False
+            response.message = error
+            return response
+        self.__logger.info("launching '{}' for '{}'".format(spec['executable'], requester))
+        self.__nodes_by_requester.setdefault(requester, []).append(node)
+        self._emit_event(IncludeLaunchDescription(launch.LaunchDescription([node])))
+        response.success = True
+        return response
+
+    def _on_stop_nodes(self, request, response):
+        try:
+            requester = json.loads(request.load_namespace)['requester']
+        except Exception as e:
+            response.success = False
+            response.message = 'invalid request: {!r}'.format(e)
+            return response
+        self._stop_nodes(requester, 'on request')
+        response.success = True
+        return response
+
+    def _stop_nodes_of_departed_requesters(self):
+        in_graph = {
+            (ns.rstrip('/') + '/' + name)
+            for name, ns in self.__node.get_node_names_and_namespaces()
+        }
+        for requester in list(self.__nodes_by_requester):
+            if requester in in_graph:
+                self.__requesters_seen_in_graph.add(requester)
+            elif requester in self.__requesters_seen_in_graph:
+                self._stop_nodes(requester, 'as it left the ROS graph')
+
+    def _stop_nodes(self, requester, reason):
+        self.__requesters_seen_in_graph.discard(requester)
+        nodes = self.__nodes_by_requester.pop(requester, [])
+        if nodes:
+            self.__logger.info("stopping {} node(s) of '{}' {}".format(
+                len(nodes), requester, reason))
+        for node in nodes:
+            self._emit_event(ShutdownProcess(
+                process_matcher=launch.events.matches_action(node)))
 
     def shutdown(self):
         if not self.__is_running:
@@ -96,19 +178,23 @@ class MachineNode:
         self.__executor = None
         self.__node = None
         self.__context = None
+        self.__launch_context = None
 
 
 def machine_node_actions(machine_name: Text):
     """
     Return launch actions that run a MachineNode for the lifetime of the LaunchService.
 
+    The actions also mark the launch as running on `machine_name`, so Nodes with that machine
+    run locally; include them before any launch file.
     The node is started when the actions are executed and shut down on the
     launch system's Shutdown event.
     """
     machine_node = MachineNode(machine_name)
 
     def start(context):
-        machine_node.start()
+        set_local_machine_name(context, machine_name)
+        machine_node.start(context)
         return None
 
     return [

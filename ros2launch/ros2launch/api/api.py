@@ -153,7 +153,8 @@ def launch_a_launch_file(
     """
     Launch a given launch file (by path) and pass it the given launch file arguments.
 
-    If `machine_name` is given, a node named after the machine is run alongside the launch file.
+    If `machine_name` is given, Nodes for that machine run locally, and a node named after the
+    machine is run alongside the launch file, so other machines can launch Nodes here too.
     """
     for name in sorted(option_extensions.keys()):
         option_extensions[name].prestart(args)
@@ -179,6 +180,8 @@ def launch_a_launch_file(
     # Include the user provided launch file using IncludeLaunchDescription so that the
     # location of the current launch file is set.
     launch_description = launch.LaunchDescription([
+        # Machine actions come first so the launch file's Nodes know which machine they're on.
+        *(machine_node_actions(machine_name) if machine_name else []),
         launch.actions.IncludeLaunchDescription(
             launch.launch_description_sources.AnyLaunchDescriptionSource(
                 launch_file_path
@@ -186,9 +189,6 @@ def launch_a_launch_file(
             launch_arguments=parsed_launch_arguments,
         ),
     ])
-    if machine_name:
-        for action in machine_node_actions(machine_name):
-            launch_description.add_action(action)
     for name in sorted(option_extensions.keys()):
         result = option_extensions[name].prelaunch(
             launch_description,
@@ -206,7 +206,7 @@ def serve(*, machine_name, noninteractive=False, debug=False, log_file_name='lau
     """
     Run a long running LaunchService for the given machine, until it is interrupted.
 
-    No nodes are launched for now; the service just keeps the machine node alive.
+    The machine node launches Nodes that launch files on other machines send it.
     """
     launch_service = launch.LaunchService(
         noninteractive=noninteractive,
