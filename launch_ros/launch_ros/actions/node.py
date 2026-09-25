@@ -124,6 +124,7 @@ class Node(ExecuteProcess):
         remappings: Optional[SomeRemapRules] = None,
         ros_arguments: Optional[Iterable[SomeSubstitutionsType]] = None,
         arguments: Optional[Iterable[SomeSubstitutionsType]] = None,
+        machine: Optional[SomeSubstitutionsType] = None,
         **kwargs
     ) -> None:
         """
@@ -194,6 +195,7 @@ class Node(ExecuteProcess):
             passed to the node as ROS remapping rules
         :param: ros_arguments list of ROS arguments for the node
         :param: arguments list of extra arguments for the node
+        :param: machine the name of the machine this Node is meant to run on
         """
         if package is not None:
             cmd = [ExecutableInPackage(package=package, executable=executable)]
@@ -223,6 +225,7 @@ class Node(ExecuteProcess):
         self.__remappings = [] if remappings is None else list(normalize_remap_rules(remappings))
         self.__ros_arguments = ros_arguments
         self.__arguments = arguments
+        self.__machine = machine
 
         self.__expanded_node_name = self.UNSPECIFIED_NODE_NAME
         self.__expanded_node_namespace = self.UNSPECIFIED_NODE_NAMESPACE
@@ -323,6 +326,9 @@ class Node(ExecuteProcess):
         ns = entity.get_attr('namespace', optional=True)
         if ns is not None:
             kwargs['namespace'] = parser.parse_substitution(ns)
+        machine = entity.get_attr('machine', optional=True)
+        if machine is not None:
+            kwargs['machine'] = parser.parse_substitution(machine)
         remappings = entity.get_attr('remap', data_type=List[Entity], optional=True)
         if remappings is not None:
             kwargs['remappings'] = [
@@ -348,6 +354,11 @@ class Node(ExecuteProcess):
     def node_executable(self):
         """Getter for node_executable."""
         return self.__node_executable
+
+    @property
+    def node_machine(self):
+        """Getter for node_machine."""
+        return self.__machine
 
     @property
     def node_name(self):
