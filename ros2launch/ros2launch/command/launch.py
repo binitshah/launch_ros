@@ -27,6 +27,7 @@ except ImportError:
     # argcomplete < 1.9.0
     SuppressCompleter = object
 from ros2cli.command import CommandExtension
+from ros2launch.api import get_machine_name
 from ros2launch.api import get_share_file_path_from_package
 from ros2launch.api import is_launch_file
 from ros2launch.api import launch_a_launch_file
@@ -34,6 +35,7 @@ from ros2launch.api import LaunchFileNameCompleter
 from ros2launch.api import MultipleLaunchFilesError
 from ros2launch.api import print_a_launch_file
 from ros2launch.api import print_arguments_of_launch_file
+from ros2launch.api import serve
 from ros2launch.option import get_option_extensions
 from ros2pkg.api import package_name_completer
 
@@ -86,6 +88,14 @@ class LaunchCommand(CommandExtension):
         command_group.add_argument(
             '-s', '--show-args', '--show-arguments', default=False, action='store_true',
             help='Show arguments that may be given to the launch file.')
+        command_group.add_argument(
+            '--serve', default=False, action='store_true',
+            help='Run a long running launch service for this machine instead of a launch file. '
+                 'Requires a machine name (see --machine-name).')
+        parser.add_argument(
+            '--machine-name', type=str, default=None,
+            help='Name of this machine, used to name its ROS node '
+                 '(overrides the MACHINE environment variable).')
         parser.add_argument(
             '-a', '--show-all-subprocesses-output', default=False, action='store_true',
             help=("Show all launched subprocesses' output by overriding their output"
@@ -107,6 +117,7 @@ class LaunchCommand(CommandExtension):
         )
         arg = parser.add_argument(
             'package_name',
+            nargs='?',
             help='Name of the ROS package which contains the launch file')
         arg.completer = package_name_or_launch_file_completer
         arg = parser.add_argument(
@@ -127,6 +138,20 @@ class LaunchCommand(CommandExtension):
 
     def main(self, *, parser, args):
         """Entry point for CLI program."""
+        machine_name = get_machine_name(args.machine_name)
+        if args.serve:
+            if args.package_name is not None:
+                return '--serve does not take a launch file'
+            if machine_name is None:
+                return '--serve requires --machine-name or the MACHINE environment variable'
+            return serve(
+                machine_name=machine_name,
+                noninteractive=args.noninteractive,
+                debug=args.debug,
+                log_file_name=args.log_file_name)
+        if args.package_name is None:
+            return 'No launch file supplied'
+
         mode = 'single file'
         # Test if first argument is a file, and if not change to pkg
         # file mode.
@@ -178,5 +203,6 @@ class LaunchCommand(CommandExtension):
                 noninteractive=args.noninteractive,
                 args=args,
                 option_extensions=self._option_extensions,
-                debug=args.debug
+                debug=args.debug,
+                machine_name=machine_name
             )

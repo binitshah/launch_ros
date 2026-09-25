@@ -26,6 +26,8 @@ import launch
 from launch.frontend import Parser
 from launch.launch_description_sources import get_launch_description_from_any_launch_file
 
+from .machine import machine_node_actions
+
 
 class MultipleLaunchFilesError(Exception):
     """Exception raised when multiple candidate launch files are found in a package."""
@@ -145,9 +147,14 @@ def launch_a_launch_file(
     noninteractive=False,
     args=None,
     option_extensions={},
-    debug=False
+    debug=False,
+    machine_name=None
 ):
-    """Launch a given launch file (by path) and pass it the given launch file arguments."""
+    """
+    Launch a given launch file (by path) and pass it the given launch file arguments.
+
+    If `machine_name` is given, a node named after the machine is run alongside the launch file.
+    """
     for name in sorted(option_extensions.keys()):
         option_extensions[name].prestart(args)
 
@@ -179,6 +186,9 @@ def launch_a_launch_file(
             launch_arguments=parsed_launch_arguments,
         ),
     ])
+    if machine_name:
+        for action in machine_node_actions(machine_name):
+            launch_description.add_action(action)
     for name in sorted(option_extensions.keys()):
         result = option_extensions[name].prelaunch(
             launch_description,
@@ -190,6 +200,21 @@ def launch_a_launch_file(
     for name in sorted(option_extensions.keys()):
         option_extensions[name].postlaunch(ret, args)
     return ret
+
+
+def serve(*, machine_name, noninteractive=False, debug=False, log_file_name='launch'):
+    """
+    Run a long running LaunchService for the given machine, until it is interrupted.
+
+    No nodes are launched for now; the service just keeps the machine node alive.
+    """
+    launch_service = launch.LaunchService(
+        noninteractive=noninteractive,
+        debug=debug,
+        log_file_name=log_file_name)
+    launch_service.include_launch_description(
+        launch.LaunchDescription(machine_node_actions(machine_name)))
+    return launch_service.run(shutdown_when_idle=False)
 
 
 class LaunchFileNameCompleter:

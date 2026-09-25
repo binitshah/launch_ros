@@ -25,9 +25,12 @@ from .api import MultipleLaunchFilesError
 from .api import print_a_launch_file
 from .api import print_arguments_of_launch_description
 from .api import print_arguments_of_launch_file
+from .api import serve
+from .machine import get_machine_name
 
 
 __all__ = [
+    'get_machine_name',
     'get_share_file_path_from_package',
     'is_launch_file',
     'InvalidLaunchFileError',
@@ -38,4 +41,5 @@ __all__ = [
     'print_a_launch_file',
     'print_arguments_of_launch_description',
     'print_arguments_of_launch_file',
+    'serve',
 ]
